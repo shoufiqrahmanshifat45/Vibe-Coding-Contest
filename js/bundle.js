@@ -1,6 +1,6 @@
 /**
  * TenderFlow — Intelligent Tender Package Builder
- * Production Unified Bundle (Offline & file:// Protocol Compatible)
+ * Production Universal Bundle (Offline & file:// Protocol Compatible)
  * AI DevFest Vibe Coding Contest
  */
 
@@ -230,17 +230,11 @@
   class Store {
     constructor() {
       this.state = {
-        tender: {
-          tender_id: "T-2026-0417",
-          title: "Procurement of High-Performance IT Infrastructure & Datacenter Equipment",
-          procuring_entity: "Department of Digital Transformation",
-          bidder: "Apex Technologies & Solutions Ltd.",
-          submission_deadline: "2026-11-30"
-        },
-        requirements: [],
-        uploadedFiles: [],
-        matches: {},       // requirementId -> fileId
-        expiries: {},      // requirementId -> YYYY-MM-DD
+        tender: null,       // Dynamic tender details
+        requirements: [],   // Array of { id, order, title_en, title_bn, mandatory, has_expiry }
+        uploadedFiles: [],  // Array of { id, file, filename, size, pageCount, contentHash, ... }
+        matches: {},        // requirementId -> fileId
+        expiries: {},       // requirementId -> YYYY-MM-DD
         activeFilter: 'all',
         isGenerating: false,
         options: {
@@ -264,18 +258,35 @@
 
     notify() {
       for (const listener of this.listeners) {
-        listener(this.state);
+        try {
+          listener(this.state);
+        } catch (e) {
+          console.error("Store notification error:", e);
+        }
       }
     }
 
     setTender(tenderData) {
-      this.state.tender = { ...tenderData };
+      this.state.tender = tenderData ? { ...tenderData } : null;
       this.notify();
     }
 
     setRequirements(requirements) {
-      const sorted = [...requirements].sort((a, b) => Number(a.order) - Number(b.order));
+      const sorted = Array.isArray(requirements)
+        ? [...requirements].sort((a, b) => Number(a.order) - Number(b.order))
+        : [];
       this.state.requirements = sorted;
+      this.notify();
+    }
+
+    loadTenderSpecification(tenderData, requirements) {
+      this.state.tender = tenderData ? { ...tenderData } : null;
+      this.state.requirements = Array.isArray(requirements)
+        ? [...requirements].sort((a, b) => Number(a.order) - Number(b.order))
+        : [];
+      this.state.matches = {};
+      this.state.expiries = {};
+      this.state.activeFilter = 'all';
       this.notify();
     }
 
@@ -332,7 +343,7 @@
 
     setExpiryDate(requirementId, dateString) {
       if (dateString) {
-        this.state.expiries[requirementId] = dateString;
+        this.state.expiries[requirementId] = dateString.trim();
       } else {
         delete this.state.expiries[requirementId];
       }
@@ -346,6 +357,16 @@
 
     setOptions(newOptions) {
       this.state.options = { ...this.state.options, ...newOptions };
+      this.notify();
+    }
+
+    resetAll() {
+      this.state.tender = null;
+      this.state.requirements = [];
+      this.state.uploadedFiles = [];
+      this.state.matches = {};
+      this.state.expiries = {};
+      this.state.activeFilter = 'all';
       this.notify();
     }
   }
@@ -366,7 +387,7 @@
 
   function normalizeDate(dateStr) {
     if (!dateStr) return null;
-    const match = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    const match = String(dateStr).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
     return match ? `${match[1]}-${match[2]}-${match[3]}` : String(dateStr).trim();
   }
 
@@ -412,7 +433,7 @@
         };
       }
 
-      // If cleanExpiry >= cleanDeadline, status is OK (including exact equality)
+      // If cleanExpiry >= cleanDeadline, status is strictly OK
       return {
         status: STATUS_TYPES.OK,
         isBlocking: false,
@@ -428,7 +449,7 @@
   }
 
   function evaluateCompliance(state) {
-    const { tender, requirements, uploadedFiles, matches, expiries } = state;
+    const { tender, requirements = [], uploadedFiles = [], matches = {}, expiries = {} } = state;
     const deadline = tender?.submission_deadline || '';
 
     const fileMap = new Map();
@@ -447,7 +468,7 @@
       blockingCount: 0
     };
 
-    // Duplicate detection in file library
+    // Group files by contentHash for duplicate detection
     const hashGroups = new Map();
     for (const f of uploadedFiles) {
       if (f.contentHash) {
@@ -525,7 +546,7 @@
       statusMap,
       metrics,
       blockingIssues,
-      canGenerate: blockingIssues.length === 0 && requirements.length > 0
+      canGenerate: blockingIssues.length === 0 && requirements.length > 0 && Boolean(tender)
     };
   }
 
@@ -564,10 +585,23 @@
     return Math.min(score, 1.0);
   }
 
-  function generateAutoMatchSuggestions(requirements, uploadedFiles, currentMatches = {}) {
+  function generateAutoMatchSuggestions(requirements = [], uploadedFiles = [], currentMatches = {}) {
     const suggestions = [];
     const usedFileIds = new Set(Object.values(currentMatches));
-    const availableFiles = uploadedFiles.filter(f => !f.processingError && !usedFileIds.has(f.id));
+    const fileMap = new Map(uploadedFiles.map(f => [f.id, f]));
+    const usedHashes = new Set();
+    for (const fId of usedFileIds) {
+      const f = fileMap.get(fId);
+      if (f && f.contentHash) usedHashes.add(f.contentHash);
+    }
+
+    const availableFiles = uploadedFiles.filter(f => {
+      if (f.processingError) return false;
+      if (usedFileIds.has(f.id)) return false;
+      if (f.contentHash && usedHashes.has(f.contentHash)) return false;
+      return true;
+    });
+
     const unmatchedReqs = requirements.filter(r => !currentMatches[r.id]);
     const assignedFiles = new Set();
 
@@ -589,6 +623,8 @@
         suggestions.push({
           requirementId: req.id,
           requirementTitle: req.title_en,
+          requirementTitleBn: req.title_bn,
+          requirementOrder: req.order,
           fileId: bestMatch.id,
           filename: bestMatch.filename,
           score: Math.round(highestScore * 100)
@@ -600,21 +636,29 @@
 
   function checkDuplicateConflict(file, targetReqId, state) {
     if (!file || !file.contentHash) return null;
-    const { matches, uploadedFiles } = state;
+    const { matches = {}, uploadedFiles = [], requirements = [] } = state;
     const fileMap = new Map(uploadedFiles.map(f => [f.id, f]));
+    const reqMap = new Map(requirements.map(r => [r.id, r]));
 
     for (const [reqId, matchedFileId] of Object.entries(matches)) {
       if (reqId === targetReqId) continue;
       const existingFile = fileMap.get(matchedFileId);
       if (existingFile && existingFile.contentHash === file.contentHash) {
+        const conflictReq = reqMap.get(reqId);
         return {
           conflictingReqId: reqId,
+          conflictingOrder: conflictReq?.order || reqId,
+          conflictingReqTitle: conflictReq?.title_en || reqId,
           conflictingFileName: existingFile.filename
         };
       }
     }
     return null;
   }
+
+  /* ==========================================================================
+     5. PDF Processing Engine (pdf-lib & Web Crypto)
+     ========================================================================== */
 
   function sha256Fallback(bytes) {
     const K = [
@@ -678,10 +722,22 @@
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
       } catch (err) {
-        console.warn("Web Crypto Subtle failed, using pure JS hasher:", err);
+        console.warn("SubtleCrypto failed, using pure JS hasher:", err);
       }
     }
     return sha256Fallback(new Uint8Array(arrayBuffer));
+  }
+
+  function sanitizePdfText(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+      .replace(/[\u2013\u2014\u2212]/g, '-')
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/[\u2022\u2023\u25E6]/g, '*')
+      .replace(/[\u2026]/g, '...')
+      .replace(/[^\x00-\xFF]/g, ' ')
+      .trim();
   }
 
   async function inspectPdfFile(file) {
@@ -721,7 +777,7 @@
     if (!window.PDFLib) throw new Error("PDF engine not initialized.");
     const { PDFDocument, rgb, StandardFonts } = window.PDFLib;
 
-    onProgress(10, "Initializing package document...");
+    onProgress("Initializing package document...", 5);
     const packageDoc = await PDFDocument.create();
 
     const fontRegular = await packageDoc.embedFont(StandardFonts.Helvetica);
@@ -748,7 +804,7 @@
     }
 
     // --- 1. OFFICIAL COVER PAGE (English) ---
-    onProgress(20, "Creating official cover page...");
+    onProgress("Preparing official cover page...", 15);
     const coverPage = packageDoc.addPage([595.28, 841.89]);
     const { width: cWidth, height: cHeight } = coverPage.getSize();
 
@@ -780,7 +836,8 @@
     });
 
     curY -= 28;
-    coverPage.drawText(`TENDER REF: ${tender.tender_id || 'N/A'}`, {
+    const safeTenderId = sanitizePdfText(tender?.tender_id || 'N/A');
+    coverPage.drawText(`TENDER REF: ${safeTenderId}`, {
       x: 54,
       y: curY,
       size: 20,
@@ -806,7 +863,7 @@
     });
 
     curY -= 18;
-    const safeTitle = tender.title || 'Untitled Tender';
+    const safeTitle = sanitizePdfText(tender?.title || 'Untitled Tender');
     const titleWords = safeTitle.split(' ');
     let titleLine = '';
     for (const word of titleWords) {
@@ -829,13 +886,13 @@
     const col2X = 310;
 
     coverPage.drawText("PROCURING ENTITY:", { x: col1X, y: gridStartY, size: 8, font: fontBold, color: textMuted });
-    coverPage.drawText(tender.procuring_entity || 'N/A', { x: col1X, y: gridStartY - 15, size: 11, font: fontRegular, color: textColor });
+    coverPage.drawText(sanitizePdfText(tender?.procuring_entity || 'N/A'), { x: col1X, y: gridStartY - 15, size: 11, font: fontRegular, color: textColor });
 
     coverPage.drawText("BIDDER / TENDERER:", { x: col2X, y: gridStartY, size: 8, font: fontBold, color: textMuted });
-    coverPage.drawText(tender.bidder || 'N/A', { x: col2X, y: gridStartY - 15, size: 11, font: fontBold, color: primaryColor });
+    coverPage.drawText(sanitizePdfText(tender?.bidder || 'N/A'), { x: col2X, y: gridStartY - 15, size: 11, font: fontBold, color: primaryColor });
 
     coverPage.drawText("SUBMISSION DEADLINE:", { x: col1X, y: gridStartY - 40, size: 8, font: fontBold, color: textMuted });
-    coverPage.drawText(tender.submission_deadline || 'N/A', { x: col1X, y: gridStartY - 55, size: 11, font: fontBold, color: rgb(0.8, 0.2, 0.2) });
+    coverPage.drawText(sanitizePdfText(tender?.submission_deadline || 'N/A'), { x: col1X, y: gridStartY - 55, size: 11, font: fontBold, color: rgb(0.8, 0.2, 0.2) });
 
     const nowFormatted = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
     coverPage.drawText("PACKAGE ASSEMBLED ON:", { x: col2X, y: gridStartY - 40, size: 8, font: fontBold, color: textMuted });
@@ -872,7 +929,7 @@
     let rowIdx = 0;
     for (const item of includedDocs) {
       if (curY < 120) {
-        coverPage.drawText(`... and ${includedDocs.length - rowIdx} additional document(s) (see Index page)`, {
+        coverPage.drawText(`... and ${includedDocs.length - rowIdx} additional document(s) (see Table of Contents)`, {
           x: 60,
           y: curY,
           size: 8,
@@ -894,10 +951,10 @@
       }
 
       const orderNum = String(item.req.order || (rowIdx + 1));
-      const titleText = item.req.title_en.substring(0, 32);
-      const fileNameText = item.file.filename.substring(0, 26);
+      const titleText = sanitizePdfText(item.req.title_en).substring(0, 32);
+      const fileNameText = sanitizePdfText(item.file.filename).substring(0, 26);
       const pageText = String(item.file.pageCount || 1);
-      const expiryText = item.expiryDate || 'N/A';
+      const expiryText = sanitizePdfText(item.expiryDate);
 
       coverPage.drawText(orderNum, { x: 60, y: curY, size: 8, font: fontBold, color: textColor });
       coverPage.drawText(titleText, { x: 80, y: curY, size: 8, font: fontRegular, color: textColor });
@@ -953,7 +1010,7 @@
     }
 
     if (includeIndexPage) {
-      onProgress(35, "Generating Table of Contents / Index...");
+      onProgress("Generating Table of Contents / Index...", 30);
       const indexPage = packageDoc.addPage([595.28, 841.89]);
       const { width: iWidth, height: iHeight } = indexPage.getSize();
 
@@ -1012,6 +1069,8 @@
 
       let idxNum = 0;
       for (const item of includedDocs) {
+        if (iY < 60) break;
+
         if (idxNum % 2 === 1) {
           indexPage.drawRectangle({
             x: 54,
@@ -1027,8 +1086,8 @@
         const pageSpan = (item.file.pageCount > 1) ? `pp. ${startPg} - ${endPg}` : `p. ${startPg}`;
 
         indexPage.drawText(String(item.req.order), { x: 65, y: iY, size: 8.5, font: fontBold, color: textColor });
-        indexPage.drawText(item.req.title_en.substring(0, 32), { x: 105, y: iY, size: 8.5, font: fontRegular, color: textColor });
-        indexPage.drawText(item.file.filename.substring(0, 24), { x: 290, y: iY, size: 8, font: fontRegular, color: textMuted });
+        indexPage.drawText(sanitizePdfText(item.req.title_en).substring(0, 32), { x: 105, y: iY, size: 8.5, font: fontRegular, color: textColor });
+        indexPage.drawText(sanitizePdfText(item.file.filename).substring(0, 24), { x: 290, y: iY, size: 8, font: fontRegular, color: textMuted });
         indexPage.drawText(String(item.file.pageCount), { x: 430, y: iY, size: 8.5, font: fontRegular, color: textColor });
         indexPage.drawText(pageSpan, { x: 480, y: iY, size: 8.5, font: fontBold, color: primaryColor });
 
@@ -1041,8 +1100,8 @@
     let docCount = 0;
     for (const item of includedDocs) {
       docCount++;
-      const progressPercent = 40 + Math.round((docCount / includedDocs.length) * 40);
-      onProgress(progressPercent, `Merging document ${docCount}/${includedDocs.length}: ${item.file.filename}...`);
+      const progressPercent = 35 + Math.round((docCount / includedDocs.length) * 45);
+      onProgress(`Combining document ${docCount}/${includedDocs.length}: ${sanitizePdfText(item.file.filename)}...`, progressPercent);
 
       try {
         const srcDoc = await PDFDocument.load(item.file.arrayBuffer, { ignoreEncryption: true });
@@ -1054,14 +1113,14 @@
         }
       } catch (err) {
         console.error(`Error copying pages from ${item.file.filename}:`, err);
-        throw new Error(`Failed to merge document "${item.file.filename}". File may be corrupted.`);
+        throw new Error(`Failed to merge document "${item.file.filename}". File may be corrupted or protected.`);
       }
     }
 
     // --- 4. SIGNATURE / SEAL PNG EMBEDDING ---
     if (signatureConfig && signatureConfig.dataUrl) {
       try {
-        onProgress(85, "Stamping digital seal and signature...");
+        onProgress("Applying digital seal and signature stamp...", 85);
         const pngImageBytes = await fetch(signatureConfig.dataUrl).then(res => res.arrayBuffer());
         const embeddedPng = await packageDoc.embedPng(pngImageBytes);
 
@@ -1093,7 +1152,7 @@
     }
 
     // --- 5. STAMP UNIFORM FOOTERS ON EVERY PAGE ("<tender_id> | Page X of Y") ---
-    onProgress(90, "Applying dynamic pagination footers...");
+    onProgress("Applying dynamic pagination footers...", 90);
     const totalFinalPages = packageDoc.getPageCount();
     const pages = packageDoc.getPages();
 
@@ -1101,15 +1160,24 @@
       const page = pages[idx];
       const { width: pWidth } = page.getSize();
       const pageNumber = idx + 1;
-      const footerText = `${tender.tender_id || 'TenderFlow'} | Page ${pageNumber} of ${totalFinalPages}`;
+      const footerText = `${safeTenderId} | Page ${pageNumber} of ${totalFinalPages}`;
 
       const textWidth = fontRegular.widthOfTextAtSize(footerText, 8);
       const footerX = (pWidth - textWidth) / 2;
       const footerY = 16;
 
+      page.drawRectangle({
+        x: 36,
+        y: footerY - 4,
+        width: pWidth - 72,
+        height: 18,
+        color: rgb(1, 1, 1),
+        opacity: 0.92
+      });
+
       page.drawLine({
-        start: { x: 36, y: footerY + 12 },
-        end: { x: pWidth - 36, y: footerY + 12 },
+        start: { x: 36, y: footerY + 14 },
+        end: { x: pWidth - 36, y: footerY + 14 },
         thickness: 0.5,
         color: rgb(0.85, 0.85, 0.85)
       });
@@ -1123,9 +1191,9 @@
       });
     }
 
-    onProgress(98, "Finalizing package bytes...");
+    onProgress("Finalizing package...", 98);
     const pdfBytes = await packageDoc.save();
-    onProgress(100, "Package generated successfully!");
+    onProgress("Package generated successfully.", 100);
 
     return pdfBytes;
   }
@@ -1144,7 +1212,7 @@
     a.click();
     document.body.removeChild(a);
 
-    setTimeout(() => URL.revokeObjectURL(downloadUrl), 15000);
+    setTimeout(() => URL.revokeObjectURL(downloadUrl), 30000);
     return filename;
   }
 
@@ -1334,7 +1402,11 @@
 
   /* ==========================================================================
      7. UI Renderers & Toast Notifications
-     ========================================================================= */
+     ========================================================================== */
+
+  let lastGeneratedBlobUrl = null;
+  let lastGeneratedBytes = null;
+  let lastGeneratedFilename = null;
 
   function formatFileSize(bytes) {
     if (!bytes || bytes === 0) return '0 B';
@@ -1373,7 +1445,7 @@
 
   function renderStepper(compliance) {
     const state = store.getState();
-    const hasReqs = state.requirements.length > 0;
+    const hasReqs = state.tender && state.requirements.length > 0;
     const hasFiles = state.uploadedFiles.length > 0;
     const hasMatches = Object.keys(state.matches).length > 0;
     const isReady = compliance.canGenerate;
@@ -1394,18 +1466,115 @@
   function renderTenderOverview() {
     const state = store.getState();
     const tender = state.tender;
+    const card = document.querySelector('.tender-hero-card');
+    if (!card) return;
 
-    const idEl = document.getElementById('tender-id-display');
-    const titleEl = document.getElementById('tender-title-display');
-    const entityEl = document.getElementById('tender-entity-display');
-    const bidderEl = document.getElementById('tender-bidder-display');
-    const deadlineEl = document.getElementById('tender-deadline-display');
+    if (!tender) {
+      card.innerHTML = `
+        <div style="padding:1.5rem; text-align:center; display:flex; flex-direction:column; align-items:center; gap:0.75rem;">
+          <div style="width:48px; height:48px; border-radius:50%; background:var(--color-primary-light); color:var(--color-primary); display:flex; align-items:center; justify-content:center;">
+            <svg width="24" height="24" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+            </svg>
+          </div>
+          <h2 style="font-size:1.25rem; font-weight:700; color:var(--color-text-main);">Start by loading the tender requirements.</h2>
+          <p style="font-size:0.85rem; color:var(--color-text-muted); max-width:540px;">
+            Import an official <code>requirements.json</code> specification, or load a demonstration preset to explore the workflow.
+          </p>
+          <div style="display:flex; gap:0.75rem; margin-top:0.5rem; flex-wrap:wrap; justify-content:center;">
+            <button type="button" class="btn btn-primary" id="btn-hero-load-req">
+              <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+              </svg>
+              <span>Import requirements.json</span>
+            </button>
+            <button type="button" class="btn btn-secondary" id="btn-hero-load-preset">
+              <span>⚡ Load Demo IT Tender</span>
+            </button>
+          </div>
+        </div>
+      `;
 
-    if (idEl) idEl.textContent = tender.tender_id || 'N/A';
-    if (titleEl) titleEl.textContent = tender.title || 'Untitled Tender';
-    if (entityEl) entityEl.textContent = tender.procuring_entity || 'N/A';
-    if (bidderEl) bidderEl.textContent = tender.bidder || 'N/A';
-    if (deadlineEl) deadlineEl.textContent = tender.submission_deadline || 'YYYY-MM-DD';
+      const btnReq = document.getElementById('btn-hero-load-req');
+      const inputReq = document.getElementById('req-file-input');
+      if (btnReq && inputReq) btnReq.onclick = () => inputReq.click();
+
+      const btnPreset = document.getElementById('btn-hero-load-preset');
+      if (btnPreset) btnPreset.onclick = () => loadPresetTender('standard_ict');
+      return;
+    }
+
+    card.innerHTML = `
+      <div class="hero-header">
+        <div class="hero-main-info">
+          <div class="tender-id-tag">
+            <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/>
+            </svg>
+            <span id="tender-id-display">${tender.tender_id || 'N/A'}</span>
+          </div>
+          <h2 class="tender-title-text" id="tender-title-display">${tender.title || 'Untitled Tender'}</h2>
+        </div>
+
+        <div class="hero-actions">
+          <button type="button" class="btn btn-outline-primary btn-sm" id="btn-change-requirements">
+            <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+            </svg>
+            <span>Change requirements.json</span>
+          </button>
+
+          <select class="custom-select" id="preset-tender-select" style="font-size:0.8rem; padding:0.35rem 0.6rem;">
+            <option value="">Load Preset Tender...</option>
+            <option value="standard_ict">Standard ICT & Workstations</option>
+            <option value="medical_supplies">Medical Equipment Tender</option>
+          </select>
+
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-save-project" title="Export Project State">
+            <span>Save Project</span>
+          </button>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-open-project" title="Open Saved Project">
+            <span>Open Project</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="tender-meta-grid">
+        <div class="meta-item">
+          <span class="meta-label">Procuring Entity</span>
+          <span class="meta-value">${tender.procuring_entity || '—'}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Bidder / Contractor</span>
+          <span class="meta-value">${tender.bidder || '—'}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Submission Deadline</span>
+          <span class="meta-value deadline-highlight">${tender.submission_deadline || '—'}</span>
+        </div>
+      </div>
+    `;
+
+    const btnChange = document.getElementById('btn-change-requirements');
+    const inputReq = document.getElementById('req-file-input');
+    if (btnChange && inputReq) btnChange.onclick = () => inputReq.click();
+
+    const presetSelect = document.getElementById('preset-tender-select');
+    if (presetSelect) {
+      presetSelect.onchange = (e) => {
+        if (e.target.value) {
+          loadPresetTender(e.target.value);
+          e.target.value = '';
+        }
+      };
+    }
+
+    const btnSave = document.getElementById('btn-save-project');
+    if (btnSave) btnSave.onclick = handleSaveProject;
+
+    const btnOpen = document.getElementById('btn-open-project');
+    const projectInput = document.getElementById('project-file-input');
+    if (btnOpen && projectInput) btnOpen.onclick = () => projectInput.click();
   }
 
   function renderMetrics(compliance) {
@@ -1442,6 +1611,13 @@
     const banner = document.getElementById('blocking-alert-banner');
     if (!banner) return;
 
+    const state = store.getState();
+    if (!state.tender) {
+      banner.style.display = 'none';
+      return;
+    }
+    banner.style.display = 'flex';
+
     const { blockingIssues, canGenerate } = compliance;
     const lang = getLang();
 
@@ -1449,55 +1625,97 @@
       banner.className = 'blocking-alert-card ready-state';
       banner.innerHTML = `
         <div class="alert-icon-box">
-          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+          <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"/>
           </svg>
         </div>
         <div class="alert-content-box">
-          <div class="alert-headline">${t('allReadyTitle')}</div>
+          <div class="alert-headline">${t('allReadyTitle')} (PACKAGE READY)</div>
           <div class="alert-subtext">${t('allReadyDesc')}</div>
         </div>
+        <button type="button" class="btn btn-primary btn-sm btn-pulse" id="btn-quick-generate-jump">
+          <span>Proceed to Generate</span>
+        </button>
       `;
+
+      const jumpBtn = document.getElementById('btn-quick-generate-jump');
+      if (jumpBtn) {
+        jumpBtn.onclick = () => {
+          document.querySelector('.action-generation-bar')?.scrollIntoView({ behavior: 'smooth' });
+        };
+      }
     } else {
       banner.className = 'blocking-alert-card has-blocking';
 
-      let issuesChipsHtml = '';
+      let issuesRowsHtml = '';
       for (const issue of blockingIssues) {
         const title = (lang === 'bn' && issue.title_bn) ? issue.title_bn : issue.title_en;
-        let statusLabel = t(`status_${issue.status}`);
+        let reasonText = '';
+        let actionLabel = '';
+        let actionType = '';
+
         if (issue.duplicateConflict) {
-          statusLabel = t('duplicateBadge');
+          reasonText = `Duplicate file binary content used across multiple requirements (#${issue.duplicateConflict.conflictingReqId || 'Conflict'}).`;
+          actionLabel = 'Fix Duplicate';
+          actionType = 'file';
+        } else if (issue.status === STATUS_TYPES.MISSING) {
+          reasonText = 'Required document has no matched PDF.';
+          actionLabel = 'Match File';
+          actionType = 'file';
+        } else if (issue.status === STATUS_TYPES.EXPIRY_NEEDED) {
+          reasonText = 'Expiry date must be specified for this requirement.';
+          actionLabel = 'Enter Expiry';
+          actionType = 'expiry';
+        } else if (issue.status === STATUS_TYPES.EXPIRED) {
+          reasonText = `Document has expired (${issue.reasonParams?.expiry} is before deadline ${issue.reasonParams?.deadline}).`;
+          actionLabel = 'Update Expiry';
+          actionType = 'expiry';
         }
 
-        issuesChipsHtml += `
-          <button class="blocking-issue-chip" data-req-id="${issue.reqId}">
-            <span>#${issue.order}: ${title}</span>
-            <strong>(${statusLabel})</strong>
-          </button>
+        issuesRowsHtml += `
+          <div class="blocking-issue-row" style="display:flex; align-items:center; justify-content:space-between; padding:0.4rem 0.6rem; background:#fff; border-radius:var(--radius-sm); border:1px solid var(--color-missing-border); font-size:0.8rem; gap:0.5rem; flex-wrap:wrap;">
+            <div>
+              <strong>#${issue.order}: ${title}</strong> — <span style="color:var(--color-missing);">${reasonText}</span>
+            </div>
+            <button type="button" class="btn btn-secondary btn-sm btn-jump-resolve" data-req-id="${issue.reqId}" data-action-type="${actionType}" style="padding:0.2rem 0.5rem; font-size:0.75rem;">
+              ${actionLabel} →
+            </button>
+          </div>
         `;
       }
 
       banner.innerHTML = `
         <div class="alert-icon-box">
-          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+          <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
           </svg>
         </div>
-        <div class="alert-content-box">
-          <div class="alert-headline">${t('blockingTitle')} (${blockingIssues.length} ${t('blockingIssues').toLowerCase()})</div>
-          <div class="alert-subtext">${t('blockingDesc')}</div>
-          <div class="blocking-issues-list">${issuesChipsHtml}</div>
+        <div class="alert-content-box" style="width:100%;">
+          <div class="alert-headline">${t('blockingTitle')} (PACKAGE NOT READY)</div>
+          <div class="alert-subtext">${blockingIssues.length} issue(s) must be resolved before the submission package can be generated:</div>
+          <div style="display:flex; flex-direction:column; gap:0.35rem; margin-top:0.5rem;">
+            ${issuesRowsHtml}
+          </div>
         </div>
       `;
 
-      banner.querySelectorAll('.blocking-issue-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-          const reqId = chip.dataset.reqId;
+      banner.querySelectorAll('.btn-jump-resolve').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const reqId = e.currentTarget.dataset.reqId;
+          const actionType = e.currentTarget.dataset.actionType;
           const targetRow = document.getElementById(`req-row-${reqId}`);
           if (targetRow) {
             targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
             targetRow.classList.add('highlighted');
             setTimeout(() => targetRow.classList.remove('highlighted'), 2500);
+
+            if (actionType === 'expiry') {
+              const input = targetRow.querySelector('.req-expiry-input');
+              if (input) input.focus();
+            } else {
+              const select = targetRow.querySelector('.req-file-select');
+              if (select) select.focus();
+            }
           }
         });
       });
@@ -1509,21 +1727,18 @@
     if (!container) return;
 
     const state = store.getState();
-    const { requirements, uploadedFiles, matches, expiries, activeFilter } = state;
+    const { requirements = [], uploadedFiles = [], matches = {}, expiries = {}, activeFilter } = state;
     const { statusMap } = compliance;
     const lang = getLang();
 
-    if (requirements.length === 0) {
+    if (!state.tender || requirements.length === 0) {
       container.innerHTML = `
         <div class="empty-state">
           <div class="empty-state-icon">📋</div>
           <div class="empty-state-title">No Requirements Loaded</div>
-          <div class="empty-state-desc">Start by loading requirements.json or click "Load Sample Tender" above.</div>
-          <button class="btn btn-primary btn-sm" id="btn-load-sample-empty">${t('sampleTenders')}</button>
+          <div class="empty-state-desc">Start by loading requirements.json or try a preset tender above.</div>
         </div>
       `;
-      const btn = document.getElementById('btn-load-sample-empty');
-      if (btn) btn.addEventListener('click', () => loadPresetTender('standard_ict'));
       return;
     }
 
@@ -1548,7 +1763,12 @@
       return;
     }
 
-    const validFiles = uploadedFiles.filter(f => !f.processingError);
+    const fileMap = new Map(uploadedFiles.map(f => [f.id, f]));
+    const matchedHashesToReq = new Map();
+    for (const [rId, fId] of Object.entries(matches)) {
+      const f = fileMap.get(fId);
+      if (f && f.contentHash) matchedHashesToReq.set(f.contentHash, rId);
+    }
 
     let html = '';
     for (const req of filtered) {
@@ -1563,27 +1783,48 @@
 
       const statusBadgeClass = `status-${status}`;
       let statusText = t(`status_${status}`);
-      if (statusData && statusData.duplicateConflict) {
-        statusText = `${t(`status_${status}`)} (${t('duplicateBadge')})`;
-      }
 
       let selectOptionsHtml = `<option value="">${t('selectFilePlaceholder')}</option>`;
-      for (const file of validFiles) {
-        const isSelected = (file.id === matchedFileId);
-        let matchLabel = '';
+      for (const file of uploadedFiles) {
+        if (file.processingError) continue;
+
+        const isCurrentMatch = (file.id === matchedFileId);
+
+        let inUseElsewhereReqId = null;
         for (const [rId, fId] of Object.entries(matches)) {
           if (fId === file.id && rId !== req.id) {
-            const otherReq = requirements.find(r => r.id === rId);
-            matchLabel = ` [In use: #${otherReq?.order || rId}]`;
+            inUseElsewhereReqId = rId;
             break;
           }
         }
 
-        let dupLabel = file.isDuplicate ? ` [${t('duplicateBadge')}]` : '';
+        let duplicateInUseReqId = null;
+        if (!isCurrentMatch && file.contentHash) {
+          const dupMatchedReqId = matchedHashesToReq.get(file.contentHash);
+          if (dupMatchedReqId && dupMatchedReqId !== req.id) {
+            duplicateInUseReqId = dupMatchedReqId;
+          }
+        }
+
+        const otherReq = inUseElsewhereReqId ? requirements.find(r => r.id === inUseElsewhereReqId) : null;
+        const dupReq = duplicateInUseReqId ? requirements.find(r => r.id === duplicateInUseReqId) : null;
+
+        let statusAnnotation = '';
+        let isDisabled = false;
+
+        if (inUseElsewhereReqId) {
+          statusAnnotation = ` [In use: #${otherReq?.order || inUseElsewhereReqId}]`;
+          isDisabled = true;
+        } else if (duplicateInUseReqId) {
+          statusAnnotation = ` [DUPLICATE - In use for #${dupReq?.order || duplicateInUseReqId}]`;
+          isDisabled = true;
+        }
+
+        let dupFlag = file.isDuplicate ? ` [${t('duplicateBadge')}]` : '';
 
         selectOptionsHtml += `
-          <option value="${file.id}" ${isSelected ? 'selected' : ''}>
-            ${file.filename} (${file.pageCount} ${file.pageCount === 1 ? 'page' : 'pages'})${dupLabel}${matchLabel}
+          <option value="${file.id}" ${isCurrentMatch ? 'selected' : ''} ${isDisabled ? 'disabled' : ''}>
+            ${file.filename} (${file.pageCount} ${file.pageCount === 1 ? 'page' : 'pages'})${dupFlag}${statusAnnotation}
           </option>
         `;
       }
@@ -1618,7 +1859,7 @@
                 ${selectOptionsHtml}
               </select>
               ${matchedFile ? `
-                <button class="btn btn-secondary btn-sm req-unmatch-btn" data-req-id="${req.id}">
+                <button type="button" class="btn btn-secondary btn-sm req-unmatch-btn" data-req-id="${req.id}">
                   ${t('unmatchBtn')}
                 </button>
               ` : ''}
@@ -1648,18 +1889,22 @@
         const reqId = e.target.dataset.reqId;
         const fileId = e.target.value;
 
-        if (fileId) {
-          const state = store.getState();
-          const selectedFile = state.uploadedFiles.find(f => f.id === fileId);
-          const dupConflict = checkDuplicateConflict(selectedFile, reqId, state);
-
-          if (dupConflict) {
-            showToast(t('duplicateMatchBlocked'), 'warning');
-          }
-          store.setMatch(reqId, fileId);
-        } else {
+        if (!fileId) {
           store.unmatch(reqId);
+          return;
         }
+
+        const state = store.getState();
+        const selectedFile = state.uploadedFiles.find(f => f.id === fileId);
+
+        const dupConflict = checkDuplicateConflict(selectedFile, reqId, state);
+        if (dupConflict) {
+          alert(`Duplicate Match Prevented:\n\nThis file has identical binary content to "${dupConflict.conflictingFileName}", which is already assigned to Requirement #${dupConflict.conflictingOrder} (${dupConflict.conflictingReqTitle}).\n\nUnder contest integrity rules, duplicate files cannot fulfill separate requirements.`);
+          e.target.value = state.matches[reqId] || '';
+          return;
+        }
+
+        store.setMatch(reqId, fileId);
       });
     });
 
@@ -1684,7 +1929,7 @@
     if (!container) return;
 
     const state = store.getState();
-    const { uploadedFiles, matches, requirements } = state;
+    const { uploadedFiles = [], matches = {}, requirements = [] } = state;
 
     const totalCount = uploadedFiles.length;
     let totalBytes = 0;
@@ -1708,8 +1953,8 @@
         <div class="empty-state">
           <div class="empty-state-icon">📁</div>
           <div class="empty-state-title">No PDF Files Uploaded</div>
-          <div class="empty-state-desc">Drag & drop tender PDFs here, or click to browse.</div>
-          <button class="btn btn-outline-primary btn-sm" id="btn-generate-demo-pdfs" style="margin-top:0.5rem;">
+          <div class="empty-state-desc">Drag & drop tender PDFs here, or click above to browse.</div>
+          <button type="button" class="btn btn-outline-primary btn-sm" id="btn-generate-demo-pdfs" style="margin-top:0.5rem;">
             ⚡ Load Demo Test PDFs
           </button>
         </div>
@@ -1731,6 +1976,16 @@
 
       const cardClass = `file-item-card ${file.isDuplicate ? 'is-duplicate' : ''} ${file.processingError ? 'is-error' : ''}`;
 
+      let quickMatchOptions = `<option value="">Quick Match To...</option>`;
+      for (const r of requirements) {
+        const isCurrentMatch = (matches[r.id] === file.id);
+        quickMatchOptions += `
+          <option value="${r.id}" ${isCurrentMatch ? 'selected' : ''}>
+            #${r.order}: ${r.title_en}
+          </option>
+        `;
+      }
+
       html += `
         <div class="${cardClass}" id="file-card-${file.id}">
           <div class="file-card-top">
@@ -1747,7 +2002,7 @@
                 ` : ''}
               </div>
             </div>
-            <button class="btn btn-icon-only btn-sm remove-file-btn" data-file-id="${file.id}" title="${t('removeFile')}">
+            <button type="button" class="btn btn-icon-only btn-sm remove-file-btn" data-file-id="${file.id}" title="${t('removeFile')}">
               <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
               </svg>
@@ -1755,8 +2010,8 @@
           </div>
 
           ${file.processingError ? `
-            <div style="font-size:0.75rem; color:var(--color-missing); font-weight:600;">
-              ${file.processingError}
+            <div style="font-size:0.75rem; color:var(--color-missing); font-weight:600; padding:0.25rem 0;">
+              ⚠️ ${file.processingError}
             </div>
           ` : `
             <div class="file-card-bottom">
@@ -1767,6 +2022,11 @@
                   <span class="match-status-unmatched">Unmatched</span>
                 `}
               </div>
+              ${requirements.length > 0 ? `
+                <select class="custom-select file-quick-match-select" data-file-id="${file.id}" style="font-size:0.72rem; padding:0.2rem 0.4rem; max-width:140px;">
+                  ${quickMatchOptions}
+                </select>
+              ` : ''}
             </div>
           `}
         </div>
@@ -1781,26 +2041,54 @@
         store.removeFile(fileId);
       });
     });
+
+    container.querySelectorAll('.file-quick-match-select').forEach(sel => {
+      sel.addEventListener('change', (e) => {
+        const fileId = e.target.dataset.fileId;
+        const targetReqId = e.target.value;
+        const state = store.getState();
+        const file = state.uploadedFiles.find(f => f.id === fileId);
+
+        if (!targetReqId) {
+          for (const [rId, fId] of Object.entries(state.matches)) {
+            if (fId === fileId) store.unmatch(rId);
+          }
+          return;
+        }
+
+        const dupConflict = checkDuplicateConflict(file, targetReqId, state);
+        if (dupConflict) {
+          alert(`Duplicate Match Prevented:\n\nThis file has identical binary content to "${dupConflict.conflictingFileName}", which is already assigned to Requirement #${dupConflict.conflictingOrder}.\n\nUnder contest integrity rules, duplicate files cannot fulfill separate requirements.`);
+          e.target.value = '';
+          return;
+        }
+
+        store.setMatch(targetReqId, fileId);
+      });
+    });
   }
 
   function renderActionBar(compliance) {
     const generateBtn = document.getElementById('btn-generate-package');
     const previewBtn = document.getElementById('btn-preview-package');
     const { canGenerate, blockingIssues } = compliance;
+    const state = store.getState();
 
     if (generateBtn) {
       generateBtn.disabled = !canGenerate;
       if (canGenerate) {
         generateBtn.classList.add('btn-pulse');
-        generateBtn.title = t('readyToGenerate');
+        generateBtn.title = "All requirements validated. Click to assemble final submission package.";
       } else {
         generateBtn.classList.remove('btn-pulse');
-        generateBtn.title = `${blockingIssues.length} ${t('blockingIssues').toLowerCase()}`;
+        generateBtn.title = state.tender
+          ? `${blockingIssues.length} blocking issue(s) must be resolved before generating the package.`
+          : "Load requirements.json to begin package assembly.";
       }
     }
 
     if (previewBtn) {
-      previewBtn.disabled = store.getState().requirements.length === 0;
+      previewBtn.disabled = !state.tender || state.requirements.length === 0;
     }
   }
 
@@ -1903,26 +2191,24 @@
     if (processedList.length > 0) {
       store.addUploadedFiles(processedList);
       updateDuplicateFlags();
-      showToast(`${processedList.length} PDF(s) processed successfully.`, 'success');
+      showToast(`${processedList.length} PDF(s) processed.`, 'success');
     }
   }
 
   async function handleGenerateDemoFiles() {
-    showToast("Generating realistic multi-page test PDFs...", "info");
+    showToast("Generating realistic multi-page test PDFs in browser...", "info");
     try {
       const demoFiles = await generateDemoPdfFiles();
       await handleFilesSelected(demoFiles);
     } catch (err) {
       console.error("Demo files error:", err);
-      showToast("Failed to generate test PDFs. " + err.message, "error");
+      showToast("Failed to generate test PDFs: " + err.message, "error");
     }
   }
 
   function loadPresetTender(presetKey = 'standard_ict') {
     const preset = SAMPLE_TENDERS[presetKey] || SAMPLE_TENDERS.standard_ict;
-    store.setTender(preset.tender);
-    store.setRequirements(preset.requirements);
-    store.setActiveFilter('all');
+    store.loadTenderSpecification(preset.tender, preset.requirements);
     showToast(`Loaded "${preset.tender.title}" (${preset.requirements.length} requirements)`, 'success');
   }
 
@@ -1933,28 +2219,52 @@
       try {
         json = JSON.parse(text);
       } catch {
-        showToast(t('errInvalidJson'), 'error');
+        alert("Invalid requirements.json file: File contains malformed JSON syntax. Please check the JSON format.");
         return;
       }
 
-      if (!json.tender || !json.requirements || !Array.isArray(json.requirements)) {
-        showToast(t('errMissingFields'), 'error');
+      if (!json.tender || typeof json.tender !== 'object') {
+        alert("Invalid requirements.json: Top-level 'tender' object is missing.");
         return;
       }
 
-      for (const req of json.requirements) {
-        if (!req.id || req.order === undefined || !req.title_en) {
-          showToast("One or more requirement items are missing required fields (id, order, title_en).", 'error');
+      const { tender, requirements } = json;
+      if (!tender.tender_id || !tender.title || !tender.procuring_entity || !tender.bidder || !tender.submission_deadline) {
+        alert("Invalid requirements.json: Tender information is missing required fields (tender_id, title, procuring_entity, bidder, or submission_deadline).");
+        return;
+      }
+
+      if (!Array.isArray(requirements) || requirements.length === 0) {
+        alert("Invalid requirements.json: 'requirements' array is missing or empty.");
+        return;
+      }
+
+      for (let i = 0; i < requirements.length; i++) {
+        const r = requirements[i];
+        if (!r.id || typeof r.id !== 'string') {
+          alert(`Invalid requirements.json: Item #${i + 1} has an invalid or missing 'id'.`);
+          return;
+        }
+        if (r.order === undefined || isNaN(Number(r.order)) || Number(r.order) <= 0) {
+          alert(`Invalid requirements.json: Item #${i + 1} ('${r.id}') has an invalid 'order' value (must be a positive number).`);
+          return;
+        }
+        if (!r.title_en || typeof r.title_en !== 'string') {
+          alert(`Invalid requirements.json: Item #${i + 1} ('${r.id}') has a missing 'title_en'.`);
+          return;
+        }
+        if (typeof r.mandatory !== 'boolean') {
+          alert(`Invalid requirements.json: Item #${i + 1} ('${r.id}') is missing boolean 'mandatory' flag.`);
           return;
         }
       }
 
-      store.setTender(json.tender);
-      store.setRequirements(json.requirements);
-      showToast(`Requirements loaded: ${json.requirements.length} documents for ${json.tender.tender_id || 'Tender'}`, 'success');
+      store.loadTenderSpecification(tender, requirements);
+      showToast(`Successfully imported tender ${tender.tender_id} (${requirements.length} requirements).`, 'success');
+
     } catch (err) {
       console.error("Requirements upload error:", err);
-      showToast(t('errInvalidJson'), 'error');
+      alert(`Failed to load requirements.json: ${err.message}`);
     }
   }
 
@@ -1976,7 +2286,7 @@
       html += `
         <div style="display:flex; align-items:center; justify-content:space-between; padding:0.75rem; border-bottom:1px solid var(--color-border); font-size:0.85rem;">
           <div>
-            <div style="font-weight:700;">${s.requirementTitle}</div>
+            <div style="font-weight:700;">#${s.requirementOrder}: ${s.requirementTitle}</div>
             <div style="color:var(--color-primary); font-size:0.8rem;">⇄ ${s.filename}</div>
           </div>
           <div style="display:flex; align-items:center; gap:0.75rem;">
@@ -1998,7 +2308,7 @@
         appliedCount++;
       });
       modal.classList.remove('is-open');
-      showToast(`Applied ${appliedCount} match suggestion(s).`, 'success');
+      showToast(`Applied ${appliedCount} suggestion(s).`, 'success');
     };
   }
 
@@ -2089,9 +2399,9 @@
     const compliance = evaluateCompliance(state);
 
     const rows = [
-      ["Tender ID", state.tender.tender_id || ""],
-      ["Tender Title", state.tender.title || ""],
-      ["Submission Deadline", state.tender.submission_deadline || ""],
+      ["Tender ID", state.tender?.tender_id || ""],
+      ["Tender Title", state.tender?.title || ""],
+      ["Submission Deadline", state.tender?.submission_deadline || ""],
       [],
       ["Order", "Requirement ID", "Document Title (EN)", "Document Title (BN)", "Mandatory", "Status", "Matched File", "Pages", "Expiry Date"]
     ];
@@ -2121,7 +2431,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${state.tender.tender_id || "Tender"}_Checklist.csv`;
+    a.download = `${state.tender?.tender_id || "Tender"}_Checklist.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -2147,7 +2457,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${state.tender.tender_id || "Tender"}_Project.tenderflow.json`;
+    a.download = `${state.tender?.tender_id || "Tender"}_Project.tenderflow.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -2161,12 +2471,11 @@
       const text = await file.text();
       const project = JSON.parse(text);
       if (!project.tender || !project.requirements) {
-        showToast("Invalid project file structure.", "error");
+        alert("Invalid project file structure: tender or requirements missing.");
         return;
       }
 
-      store.setTender(project.tender);
-      store.setRequirements(project.requirements);
+      store.loadTenderSpecification(project.tender, project.requirements);
       if (project.expiries) {
         for (const [rId, date] of Object.entries(project.expiries)) {
           store.setExpiryDate(rId, date);
@@ -2179,7 +2488,7 @@
       showToast(t('projectLoaded'), "success");
     } catch (err) {
       console.error("Open project error:", err);
-      showToast("Failed to load project file.", "error");
+      alert("Failed to load project file: " + err.message);
     }
   }
 
@@ -2193,10 +2502,25 @@
     }
 
     const modal = document.getElementById('gen-progress-modal');
+    const card = modal?.querySelector('.modal-card');
+    if (!modal || !card) return;
+
+    card.innerHTML = `
+      <div class="modal-body" style="padding:2.5rem 1.5rem; display:flex; flex-direction:column; align-items:center; gap:1.25rem;">
+        <div class="spinner" style="width:40px; height:40px; border-width:3px;"></div>
+        <div style="text-align:center;">
+          <h4 style="font-size:1.15rem; font-weight:700; color:var(--color-text-main); margin-bottom:0.35rem;">Assembling Final Tender Package</h4>
+          <p id="gen-progress-label" style="font-size:0.85rem; color:var(--color-text-muted);">Preparing official cover page...</p>
+        </div>
+        <div style="width:100%; height:8px; background:var(--color-border); border-radius:999px; overflow:hidden;">
+          <div id="gen-progress-bar" style="width:10%; height:100%; background:linear-gradient(90deg, var(--color-primary), var(--color-accent)); transition:width 0.25s ease;"></div>
+        </div>
+      </div>
+    `;
+    modal.classList.add('is-open');
+
     const bar = document.getElementById('gen-progress-bar');
     const label = document.getElementById('gen-progress-label');
-
-    if (modal) modal.classList.add('is-open');
 
     try {
       const sigConfig = state.options.signatureDataUrl ? {
@@ -2211,23 +2535,88 @@
         statusMap: compliance.statusMap,
         includeIndexPage: state.options.includeIndexPage,
         signatureConfig: sigConfig,
-        onProgress: (percent, message) => {
+        onProgress: (stageMessage, percent) => {
           if (bar) bar.style.width = `${percent}%`;
-          if (label) label.textContent = message;
+          if (label) label.textContent = stageMessage;
         }
       });
 
-      const downloadedName = downloadPackagePdf(pdfBytes, state.tender.tender_id);
-      showToast(`Package "${downloadedName}" generated and downloaded!`, "success", 6000);
+      lastGeneratedBytes = pdfBytes;
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+      if (lastGeneratedBlobUrl) URL.revokeObjectURL(lastGeneratedBlobUrl);
+      lastGeneratedBlobUrl = URL.createObjectURL(blob);
+
+      const cleanTenderId = (state.tender?.tender_id || "TENDER").replace(/[^a-zA-Z0-9_-]/g, '_');
+      lastGeneratedFilename = `${cleanTenderId}_Package.pdf`;
+
+      downloadPackagePdf(pdfBytes, state.tender?.tender_id);
 
       setTimeout(() => {
-        if (modal) modal.classList.remove('is-open');
-      }, 1200);
+        const nowStr = new Date().toLocaleString();
+        card.innerHTML = `
+          <div class="modal-header">
+            <h4 class="modal-title" style="color:var(--color-ok);">✓ Package Generated Successfully</h4>
+            <button type="button" class="btn btn-icon-only btn-close-modal" aria-label="Close">&times;</button>
+          </div>
+          <div class="modal-body" style="padding:1.5rem; display:flex; flex-direction:column; gap:1rem;">
+            <div style="background:var(--color-ok-bg); border:1px solid var(--color-ok-border); border-radius:var(--radius-md); padding:1rem; font-size:0.85rem; color:var(--color-ok-text);">
+              Your submission package has been compiled and downloaded as <strong>${lastGeneratedFilename}</strong>.
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; font-size:0.85rem;">
+              <div style="background:var(--color-surface-alt); padding:0.75rem; border-radius:var(--radius-sm);">
+                <div style="font-size:0.72rem; text-transform:uppercase; color:var(--color-text-muted);">Generated Filename</div>
+                <div style="font-weight:700; color:var(--color-primary); word-break:break-all;">${lastGeneratedFilename}</div>
+              </div>
+              <div style="background:var(--color-surface-alt); padding:0.75rem; border-radius:var(--radius-sm);">
+                <div style="font-size:0.72rem; text-transform:uppercase; color:var(--color-text-muted);">Total Enclosed Documents</div>
+                <div style="font-weight:700; color:var(--color-text-main);">${compliance.metrics.ok} Documents</div>
+              </div>
+              <div style="background:var(--color-surface-alt); padding:0.75rem; border-radius:var(--radius-sm);">
+                <div style="font-size:0.72rem; text-transform:uppercase; color:var(--color-text-muted);">Generation Date</div>
+                <div style="font-weight:700; color:var(--color-text-main);">${nowStr}</div>
+              </div>
+              <div style="background:var(--color-surface-alt); padding:0.75rem; border-radius:var(--radius-sm);">
+                <div style="font-size:0.72rem; text-transform:uppercase; color:var(--color-text-muted);">File Size</div>
+                <div style="font-weight:700; color:var(--color-text-main);">${formatFileSize(pdfBytes.length)}</div>
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer" style="display:flex; justify-content:space-between;">
+            <a href="${lastGeneratedBlobUrl}" target="_blank" class="btn btn-secondary">
+              👁️ Open PDF Preview
+            </a>
+            <button type="button" class="btn btn-primary" id="btn-re-download">
+              ⬇️ Download Again (${lastGeneratedFilename})
+            </button>
+          </div>
+        `;
+
+        card.querySelector('.btn-close-modal')?.addEventListener('click', () => {
+          modal.classList.remove('is-open');
+        });
+
+        card.querySelector('#btn-re-download')?.addEventListener('click', () => {
+          downloadPackagePdf(lastGeneratedBytes, state.tender?.tender_id);
+        });
+      }, 600);
 
     } catch (err) {
       console.error("Package assembly error:", err);
-      if (modal) modal.classList.remove('is-open');
-      showToast(`Assembly failed: ${err.message}`, "error", 6000);
+      card.innerHTML = `
+        <div class="modal-header">
+          <h4 class="modal-title" style="color:var(--color-missing);">Assembly Failed</h4>
+          <button type="button" class="btn btn-icon-only btn-close-modal">&times;</button>
+        </div>
+        <div class="modal-body" style="padding:1.5rem; font-size:0.85rem; color:var(--color-missing-text);">
+          <p><strong>Error assembling package:</strong></p>
+          <p style="margin-top:0.5rem; background:#fee2e2; padding:0.75rem; border-radius:var(--radius-sm); font-family:monospace;">${err.message}</p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary btn-close-modal">Close</button>
+        </div>
+      `;
+      card.querySelectorAll('.btn-close-modal').forEach(b => b.onclick = () => modal.classList.remove('is-open'));
     }
   }
 
@@ -2240,7 +2629,6 @@
       renderApp();
     });
 
-    // Language switcher
     document.querySelectorAll('.lang-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const selectedLang = e.currentTarget.dataset.lang;
@@ -2249,7 +2637,6 @@
       });
     });
 
-    // Requirements File Input
     const reqFileInput = document.getElementById('req-file-input');
     const btnLoadReq = document.getElementById('btn-load-requirements');
     if (btnLoadReq && reqFileInput) {
@@ -2262,7 +2649,6 @@
       });
     }
 
-    // Presets Dropdown
     const presetSelect = document.getElementById('preset-tender-select');
     if (presetSelect) {
       presetSelect.addEventListener('change', (e) => {
@@ -2273,7 +2659,6 @@
       });
     }
 
-    // Download Sample JSON
     const btnDownloadSampleJson = document.getElementById('btn-download-sample-json');
     if (btnDownloadSampleJson) {
       btnDownloadSampleJson.addEventListener('click', () => {
@@ -2281,7 +2666,6 @@
       });
     }
 
-    // PDF Dropzone & Picker
     const dropzone = document.getElementById('pdf-dropzone');
     const pdfFileInput = document.getElementById('pdf-file-input');
 
@@ -2319,7 +2703,6 @@
       });
     }
 
-    // Clear All Files
     const btnClearFiles = document.getElementById('btn-clear-files');
     if (btnClearFiles) {
       btnClearFiles.addEventListener('click', () => {
@@ -2329,7 +2712,6 @@
       });
     }
 
-    // Metric Filter Pills
     document.querySelectorAll('.metric-pill-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const filter = e.currentTarget.dataset.filter;
@@ -2345,31 +2727,26 @@
       });
     }
 
-    // Auto-Match
     const btnAutoMatch = document.getElementById('btn-auto-match');
     if (btnAutoMatch) {
       btnAutoMatch.addEventListener('click', handleOpenAutoMatch);
     }
 
-    // Preview Package
     const btnPreview = document.getElementById('btn-preview-package');
     if (btnPreview) {
       btnPreview.addEventListener('click', handleOpenPackagePreview);
     }
 
-    // Generate Package
     const btnGenerate = document.getElementById('btn-generate-package');
     if (btnGenerate) {
       btnGenerate.addEventListener('click', handleGeneratePackage);
     }
 
-    // Export CSV
     const btnExportCsv = document.getElementById('btn-export-csv');
     if (btnExportCsv) {
       btnExportCsv.addEventListener('click', handleExportChecklistCsv);
     }
 
-    // Save & Open Project
     const btnSaveProject = document.getElementById('btn-save-project');
     const btnOpenProject = document.getElementById('btn-open-project');
     const projectFileInput = document.getElementById('project-file-input');
@@ -2387,7 +2764,6 @@
       });
     }
 
-    // Package Assembly Options (Index toggle & PNG seal)
     const chkIndex = document.getElementById('opt-include-index');
     if (chkIndex) {
       chkIndex.addEventListener('change', (e) => {
@@ -2440,14 +2816,12 @@
       });
     }
 
-    // Help Modal
     const btnHelp = document.getElementById('btn-open-help');
     const helpModal = document.getElementById('help-modal');
     if (btnHelp && helpModal) {
       btnHelp.addEventListener('click', () => helpModal.classList.add('is-open'));
     }
 
-    // Modal Closers
     document.querySelectorAll('.modal-backdrop').forEach(backdrop => {
       backdrop.addEventListener('click', (e) => {
         if (e.target === backdrop) backdrop.classList.remove('is-open');
@@ -2457,8 +2831,8 @@
       });
     });
 
-    // Initial Load
-    loadPresetTender('standard_ict');
+    // Start with clean initial state
+    renderApp();
   });
 
 })();

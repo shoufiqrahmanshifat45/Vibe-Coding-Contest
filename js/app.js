@@ -242,6 +242,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // 15. Initial Demo Preset Load (Clean first load)
-  loadPresetTender('standard_ict');
+  // Initial render (starts with clean empty state, ready for unseen requirements.json)
+  renderApp();
 });

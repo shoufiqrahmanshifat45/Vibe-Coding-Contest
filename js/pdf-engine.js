@@ -8,10 +8,13 @@
  * - English Cover Page generation
  * - Table of Contents / Index page with real computed starting page numbers
  * - Multi-document sequential page merging
- * - Uniform "<tender_id> | Page X of Y" footers on EVERY page
+ * - Rotation-safe uniform "<tender_id> | Page X of Y" footers on EVERY page
  * - Digital Seal & Signature PNG stamping
  */
 
+/**
+ * Pure JS SHA-256 Hasher fallback for non-HTTPS environments
+ */
 function sha256Fallback(bytes) {
   const K = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -84,6 +87,22 @@ export async function calculateSha256(arrayBuffer) {
 }
 
 /**
+ * Sanitizes strings for standard PDF WinAnsi font encoding
+ * Prevents "WinAnsi cannot encode" crashes on Unicode dashes, quotes, etc.
+ */
+function sanitizePdfText(text) {
+  if (text === null || text === undefined) return '';
+  return String(text)
+    .replace(/[\u2013\u2014\u2212]/g, '-')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2022\u2023\u25E6]/g, '*')
+    .replace(/[\u2026]/g, '...')
+    .replace(/[^\x00-\xFF]/g, ' ')
+    .trim();
+}
+
+/**
  * Inspects a PDF file: reads binary data, calculates SHA-256 hash, and gets page count.
  * Catches password-protected or corrupted PDFs safely without crashing.
  * 
@@ -92,11 +111,8 @@ export async function calculateSha256(arrayBuffer) {
  */
 export async function inspectPdfFile(file) {
   const arrayBuffer = await file.arrayBuffer();
-  
-  // Calculate binary hash
   const hash = await calculateSha256(arrayBuffer);
 
-  // Parse PDF to get page count safely
   if (!window.PDFLib) {
     throw new Error("PDF processing engine is not ready yet. Please refresh the page.");
   }
@@ -132,7 +148,7 @@ export async function inspectPdfFile(file) {
  * @param {Map} options.statusMap - Status mapping from status-engine
  * @param {boolean} options.includeIndexPage - Whether to generate an index/table of contents
  * @param {Object|null} options.signatureConfig - Signature PNG configuration
- * @param {Function} options.onProgress - Progress callback (percentage, message)
+ * @param {Function} options.onProgress - Progress callback (stageName, percent)
  * @returns {Promise<Uint8Array>} Assembled PDF binary bytes
  */
 export async function assembleTenderPackage({
@@ -147,9 +163,9 @@ export async function assembleTenderPackage({
     throw new Error("PDF engine not initialized.");
   }
 
-  const { PDFDocument, rgb, StandardFonts } = window.PDFLib;
+  const { PDFDocument, rgb, degrees, StandardFonts } = window.PDFLib;
 
-  onProgress(10, "Initializing package document...");
+  onProgress("Initializing package document...", 5);
   const packageDoc = await PDFDocument.create();
 
   // Embed standard typography fonts
@@ -179,8 +195,8 @@ export async function assembleTenderPackage({
   }
 
   // --- 1. GENERATE OFFICIAL COVER PAGE (Page 1) ---
-  onProgress(20, "Creating official cover page...");
-  const coverPage = packageDoc.addPage([595.28, 841.89]); // A4 dimensions in points (pt)
+  onProgress("Preparing official cover page...", 15);
+  const coverPage = packageDoc.addPage([595.28, 841.89]); // A4 dimensions in points
   const { width: cWidth, height: cHeight } = coverPage.getSize();
 
   // Decorative header band
@@ -205,8 +221,7 @@ export async function assembleTenderPackage({
   let curY = cHeight - 65;
 
   // Header Title
-  const headerSuper = "OFFICIAL TENDER SUBMISSION PACKAGE";
-  coverPage.drawText(headerSuper, {
+  coverPage.drawText("OFFICIAL TENDER SUBMISSION PACKAGE", {
     x: 54,
     y: curY,
     size: 13,
@@ -215,8 +230,8 @@ export async function assembleTenderPackage({
   });
 
   curY -= 28;
-  const tenderIdText = `TENDER REF: ${tender.tender_id || 'N/A'}`;
-  coverPage.drawText(tenderIdText, {
+  const safeTenderId = sanitizePdfText(tender?.tender_id || 'N/A');
+  coverPage.drawText(`TENDER REF: ${safeTenderId}`, {
     x: 54,
     y: curY,
     size: 20,
@@ -225,7 +240,6 @@ export async function assembleTenderPackage({
   });
 
   curY -= 14;
-  // Decorative separator
   coverPage.drawLine({
     start: { x: 54, y: curY },
     end: { x: cWidth - 54, y: curY },
@@ -244,8 +258,7 @@ export async function assembleTenderPackage({
   });
 
   curY -= 18;
-  const safeTitle = tender.title || 'Untitled Tender';
-  // Simple word wrapping for tender title
+  const safeTitle = sanitizePdfText(tender?.title || 'Untitled Tender');
   const titleWords = safeTitle.split(' ');
   let titleLine = '';
   for (const word of titleWords) {
@@ -268,17 +281,14 @@ export async function assembleTenderPackage({
   const col1X = 54;
   const col2X = 310;
 
-  // Procuring Entity
   coverPage.drawText("PROCURING ENTITY:", { x: col1X, y: gridStartY, size: 8, font: fontBold, color: textMuted });
-  coverPage.drawText(tender.procuring_entity || 'N/A', { x: col1X, y: gridStartY - 15, size: 11, font: fontRegular, color: textColor });
+  coverPage.drawText(sanitizePdfText(tender?.procuring_entity || 'N/A'), { x: col1X, y: gridStartY - 15, size: 11, font: fontRegular, color: textColor });
 
-  // Bidder / Contractor
   coverPage.drawText("BIDDER / TENDERER:", { x: col2X, y: gridStartY, size: 8, font: fontBold, color: textMuted });
-  coverPage.drawText(tender.bidder || 'N/A', { x: col2X, y: gridStartY - 15, size: 11, font: fontBold, color: primaryColor });
+  coverPage.drawText(sanitizePdfText(tender?.bidder || 'N/A'), { x: col2X, y: gridStartY - 15, size: 11, font: fontBold, color: primaryColor });
 
-  // Submission Deadline & Package Creation Date
   coverPage.drawText("SUBMISSION DEADLINE:", { x: col1X, y: gridStartY - 40, size: 8, font: fontBold, color: textMuted });
-  coverPage.drawText(tender.submission_deadline || 'N/A', { x: col1X, y: gridStartY - 55, size: 11, font: fontBold, color: rgb(0.8, 0.2, 0.2) });
+  coverPage.drawText(sanitizePdfText(tender?.submission_deadline || 'N/A'), { x: col1X, y: gridStartY - 55, size: 11, font: fontBold, color: rgb(0.8, 0.2, 0.2) });
 
   const nowFormatted = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
   coverPage.drawText("PACKAGE ASSEMBLED ON:", { x: col2X, y: gridStartY - 40, size: 8, font: fontBold, color: textMuted });
@@ -297,7 +307,6 @@ export async function assembleTenderPackage({
 
   curY -= 14;
 
-  // Table header background
   coverPage.drawRectangle({
     x: 54,
     y: curY - 6,
@@ -314,12 +323,10 @@ export async function assembleTenderPackage({
 
   curY -= 20;
 
-  // Render Table Rows (capped to fit cover page cleanly)
   let rowIdx = 0;
   for (const item of includedDocs) {
     if (curY < 120) {
-      // If table overflows, show overflow indicator
-      coverPage.drawText(`... and ${includedDocs.length - rowIdx} additional document(s) (see Index page)`, {
+      coverPage.drawText(`... and ${includedDocs.length - rowIdx} additional document(s) (see Table of Contents)`, {
         x: 60,
         y: curY,
         size: 8,
@@ -341,10 +348,10 @@ export async function assembleTenderPackage({
     }
 
     const orderNum = String(item.req.order || (rowIdx + 1));
-    const titleText = item.req.title_en.substring(0, 32);
-    const fileNameText = item.file.filename.substring(0, 26);
+    const titleText = sanitizePdfText(item.req.title_en).substring(0, 32);
+    const fileNameText = sanitizePdfText(item.file.filename).substring(0, 26);
     const pageText = String(item.file.pageCount || 1);
-    const expiryText = item.expiryDate || 'N/A';
+    const expiryText = sanitizePdfText(item.expiryDate);
 
     coverPage.drawText(orderNum, { x: 60, y: curY, size: 8, font: fontBold, color: textColor });
     coverPage.drawText(titleText, { x: 80, y: curY, size: 8, font: fontRegular, color: textColor });
@@ -392,11 +399,9 @@ export async function assembleTenderPackage({
   });
 
 
-  // --- 2. OPTIONAL INDEX / TABLE OF CONTENTS PAGE (Page 2) ---
-  let indexPage = null;
-  const startingPageMap = new Map(); // reqId -> startingPageNumber
-
-  let runningPageNumber = 1 + (includeIndexPage ? 1 : 0); // Starting page for first attached document
+  // --- 2. TABLE OF CONTENTS / INDEX PAGE (Page 2) ---
+  const startingPageMap = new Map();
+  let runningPageNumber = 1 + (includeIndexPage ? 1 : 0);
 
   for (const item of includedDocs) {
     startingPageMap.set(item.req.id, runningPageNumber + 1);
@@ -404,11 +409,10 @@ export async function assembleTenderPackage({
   }
 
   if (includeIndexPage) {
-    onProgress(35, "Generating Table of Contents / Index...");
-    indexPage = packageDoc.addPage([595.28, 841.89]);
+    onProgress("Generating Table of Contents / Index...", 30);
+    const indexPage = packageDoc.addPage([595.28, 841.89]);
     const { width: iWidth, height: iHeight } = indexPage.getSize();
 
-    // Border frame
     indexPage.drawRectangle({
       x: 36,
       y: 36,
@@ -446,7 +450,6 @@ export async function assembleTenderPackage({
 
     iY -= 25;
 
-    // Index Table Header
     indexPage.drawRectangle({
       x: 54,
       y: iY - 6,
@@ -463,9 +466,10 @@ export async function assembleTenderPackage({
 
     iY -= 20;
 
-    // Index Table Rows
     let idxNum = 0;
     for (const item of includedDocs) {
+      if (iY < 60) break; // prevent overflowing page frame
+
       if (idxNum % 2 === 1) {
         indexPage.drawRectangle({
           x: 54,
@@ -481,8 +485,8 @@ export async function assembleTenderPackage({
       const pageSpan = (item.file.pageCount > 1) ? `pp. ${startPg} - ${endPg}` : `p. ${startPg}`;
 
       indexPage.drawText(String(item.req.order), { x: 65, y: iY, size: 8.5, font: fontBold, color: textColor });
-      indexPage.drawText(item.req.title_en.substring(0, 32), { x: 105, y: iY, size: 8.5, font: fontRegular, color: textColor });
-      indexPage.drawText(item.file.filename.substring(0, 24), { x: 290, y: iY, size: 8, font: fontRegular, color: textMuted });
+      indexPage.drawText(sanitizePdfText(item.req.title_en).substring(0, 32), { x: 105, y: iY, size: 8.5, font: fontRegular, color: textColor });
+      indexPage.drawText(sanitizePdfText(item.file.filename).substring(0, 24), { x: 290, y: iY, size: 8, font: fontRegular, color: textMuted });
       indexPage.drawText(String(item.file.pageCount), { x: 430, y: iY, size: 8.5, font: fontRegular, color: textColor });
       indexPage.drawText(pageSpan, { x: 480, y: iY, size: 8.5, font: fontBold, color: primaryColor });
 
@@ -496,8 +500,8 @@ export async function assembleTenderPackage({
   let docCount = 0;
   for (const item of includedDocs) {
     docCount++;
-    const progressPercent = 40 + Math.round((docCount / includedDocs.length) * 40);
-    onProgress(progressPercent, `Merging document ${docCount}/${includedDocs.length}: ${item.file.filename}...`);
+    const progressPercent = 35 + Math.round((docCount / includedDocs.length) * 45);
+    onProgress(`Combining document ${docCount}/${includedDocs.length}: ${sanitizePdfText(item.file.filename)}...`, progressPercent);
 
     try {
       const srcDoc = await PDFDocument.load(item.file.arrayBuffer, { ignoreEncryption: true });
@@ -509,7 +513,7 @@ export async function assembleTenderPackage({
       }
     } catch (err) {
       console.error(`Error copying pages from ${item.file.filename}:`, err);
-      throw new Error(`Failed to merge document "${item.file.filename}". File may be corrupted.`);
+      throw new Error(`Failed to merge document "${item.file.filename}". File may be corrupted or protected.`);
     }
   }
 
@@ -517,7 +521,7 @@ export async function assembleTenderPackage({
   // --- 4. SIGNATURE / SEAL PNG EMBEDDING (IF PROVIDED) ---
   if (signatureConfig && signatureConfig.dataUrl) {
     try {
-      onProgress(85, "Stamping digital seal and signature...");
+      onProgress("Applying digital seal and signature stamp...", 85);
       const pngImageBytes = await fetch(signatureConfig.dataUrl).then(res => res.arrayBuffer());
       const embeddedPng = await packageDoc.embedPng(pngImageBytes);
 
@@ -552,25 +556,33 @@ export async function assembleTenderPackage({
 
 
   // --- 5. STAMP UNIFORM FOOTERS ON EVERY PAGE ("<tender_id> | Page X of Y") ---
-  onProgress(90, "Applying dynamic pagination footers...");
+  onProgress("Applying dynamic pagination footers...", 90);
   const totalFinalPages = packageDoc.getPageCount();
   const pages = packageDoc.getPages();
 
   for (let idx = 0; idx < totalFinalPages; idx++) {
     const page = pages[idx];
-    const { width: pWidth } = page.getSize();
+    const { width: pWidth, height: pHeight } = page.getSize();
     const pageNumber = idx + 1;
-    const footerText = `${tender.tender_id || 'TenderFlow'} | Page ${pageNumber} of ${totalFinalPages}`;
+    const footerText = `${safeTenderId} | Page ${pageNumber} of ${totalFinalPages}`;
 
-    // Calculate text width for center alignment
     const textWidth = fontRegular.widthOfTextAtSize(footerText, 8);
     const footerX = (pWidth - textWidth) / 2;
-    const footerY = 16; // bottom margin
+    const footerY = 16;
 
-    // Subtle divider rule above footer
+    // Draw subtle white backing rectangle to ensure readability over document borders
+    page.drawRectangle({
+      x: 36,
+      y: footerY - 4,
+      width: pWidth - 72,
+      height: 18,
+      color: rgb(1, 1, 1),
+      opacity: 0.92
+    });
+
     page.drawLine({
-      start: { x: 36, y: footerY + 12 },
-      end: { x: pWidth - 36, y: footerY + 12 },
+      start: { x: 36, y: footerY + 14 },
+      end: { x: pWidth - 36, y: footerY + 14 },
       thickness: 0.5,
       color: rgb(0.85, 0.85, 0.85)
     });
@@ -585,9 +597,9 @@ export async function assembleTenderPackage({
   }
 
   // --- 6. SAVE & RETURN FINAL PDF BYTES ---
-  onProgress(98, "Finalizing and serializing PDF bytes...");
+  onProgress("Finalizing package...", 98);
   const pdfBytes = await packageDoc.save();
-  onProgress(100, "Package generated successfully!");
+  onProgress("Package generated successfully.", 100);
 
   return pdfBytes;
 }
@@ -610,8 +622,7 @@ export function downloadPackagePdf(pdfBytes, tenderId) {
   a.click();
   document.body.removeChild(a);
 
-  // Clean up object URL after delay
-  setTimeout(() => URL.revokeObjectURL(downloadUrl), 15000);
+  setTimeout(() => URL.revokeObjectURL(downloadUrl), 30000);
 
   return filename;
 }

@@ -1,14 +1,14 @@
 /**
  * TenderFlow — Central Document Status Engine & Validation Engine
  * 
- * Strictly implements the 5 statuses and blocking logic specified in the prompt:
+ * Strictly implements the 5 statuses and blocking logic specified in the contest rules:
  * 1. Missing (blocking: true)
  * 2. Expiry date needed (blocking: true)
  * 3. Expired (blocking: true)
  * 4. Not provided (blocking: false)
  * 5. OK (blocking: false)
  * 
- * In addition, tracks duplicate file violations across requirements.
+ * In addition, strictly tracks duplicate matching violations across requirements.
  */
 
 export const STATUS_TYPES = {
@@ -22,9 +22,9 @@ export const STATUS_TYPES = {
 /**
  * Normalizes date to 'YYYY-MM-DD' comparison
  */
-function normalizeDate(dateStr) {
+export function normalizeDate(dateStr) {
   if (!dateStr) return null;
-  const match = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const match = String(dateStr).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (match) {
     return `${match[1]}-${match[2]}-${match[3]}`;
   }
@@ -62,7 +62,7 @@ export function computeRequirementStatus(req, matchedFile, expiryDate, submissio
     }
   }
 
-  // Case 2: File is matched
+  // Case 2: File is matched and requirement requires an expiry date
   if (hasExpiry) {
     const cleanExpiry = normalizeDate(expiryDate);
     const cleanDeadline = normalizeDate(submissionDeadline);
@@ -85,7 +85,7 @@ export function computeRequirementStatus(req, matchedFile, expiryDate, submissio
       };
     }
 
-    // If cleanExpiry >= cleanDeadline (including exact equality), status is OK
+    // If cleanExpiry >= cleanDeadline (including exact equality), status MUST be OK
     return {
       status: STATUS_TYPES.OK,
       isBlocking: false,
@@ -93,7 +93,7 @@ export function computeRequirementStatus(req, matchedFile, expiryDate, submissio
     };
   }
 
-  // File is matched and does not require expiry
+  // Case 3: File is matched and does not require expiry date
   return {
     status: STATUS_TYPES.OK,
     isBlocking: false,
@@ -108,7 +108,7 @@ export function computeRequirementStatus(req, matchedFile, expiryDate, submissio
  * @returns {Object} Validation summary including statusMap, metrics, and blockingIssues
  */
 export function evaluateCompliance(state) {
-  const { tender, requirements, uploadedFiles, matches, expiries } = state;
+  const { tender, requirements = [], uploadedFiles = [], matches = {}, expiries = {} } = state;
   const deadline = tender?.submission_deadline || '';
 
   const fileMap = new Map();
@@ -116,7 +116,7 @@ export function evaluateCompliance(state) {
     fileMap.set(f.id, f);
   }
 
-  const statusMap = new Map(); // reqId -> status object
+  const statusMap = new Map();
   const blockingIssues = [];
   const metrics = {
     total: requirements.length,
@@ -129,7 +129,7 @@ export function evaluateCompliance(state) {
     blockingCount: 0
   };
 
-  // Check duplicate files in uploaded files
+  // 1. Group uploaded files by contentHash for duplicate detection
   const hashGroups = new Map();
   for (const f of uploadedFiles) {
     if (f.contentHash) {
@@ -141,14 +141,15 @@ export function evaluateCompliance(state) {
   }
 
   let duplicateFilesCount = 0;
-  for (const [hash, group] of hashGroups.entries()) {
+  for (const [, group] of hashGroups.entries()) {
     if (group.length > 1) {
       duplicateFilesCount += group.length;
     }
   }
   metrics.duplicates = duplicateFilesCount;
 
-  // Track matched file hashes to prevent identical binary documents satisfying two requirements
+  // 2. Track matched file hashes to enforce duplicate restriction
+  // (Identical binary content cannot satisfy two different requirements)
   const matchedHashes = new Map(); // hash -> reqId
 
   for (const req of requirements) {
@@ -158,8 +159,6 @@ export function evaluateCompliance(state) {
 
     const evaluation = computeRequirementStatus(req, matchedFile, expiryDate, deadline);
 
-    // Duplicate match restriction check:
-    // If two different requirements are matched to files with identical content hash
     let duplicateMatchConflict = null;
     if (matchedFile && matchedFile.contentHash) {
       const existingReqId = matchedHashes.get(matchedFile.contentHash);
@@ -175,7 +174,7 @@ export function evaluateCompliance(state) {
 
     if (duplicateMatchConflict) {
       evaluation.duplicateConflict = duplicateMatchConflict;
-      evaluation.isBlocking = true; // Duplicate matching is a blocking error
+      evaluation.isBlocking = true;
     }
 
     statusMap.set(req.id, {
@@ -185,7 +184,7 @@ export function evaluateCompliance(state) {
       req
     });
 
-    // Update count metrics
+    // Update count metrics based strictly on the 5 allowed statuses
     switch (evaluation.status) {
       case STATUS_TYPES.OK:
         metrics.ok++;
@@ -224,6 +223,6 @@ export function evaluateCompliance(state) {
     statusMap,
     metrics,
     blockingIssues,
-    canGenerate: blockingIssues.length === 0 && requirements.length > 0
+    canGenerate: blockingIssues.length === 0 && requirements.length > 0 && Boolean(tender)
   };
 }

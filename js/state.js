@@ -6,23 +6,17 @@
 class Store {
   constructor() {
     this.state = {
-      tender: {
-        tender_id: "T-2026-0417",
-        title: "Procurement of High-Performance IT Infrastructure & Datacenter Equipment",
-        procuring_entity: "Department of Digital Transformation",
-        bidder: "Apex Technologies & Solutions Ltd.",
-        submission_deadline: "2026-11-30"
-      },
-      requirements: [],
-      uploadedFiles: [],
-      matches: {},       // requirementId -> fileId
-      expiries: {},      // requirementId -> YYYY-MM-DD
-      activeFilter: 'all',
+      tender: null,       // Loaded dynamically from requirements.json or demo preset
+      requirements: [],   // Array of { id, order, title_en, title_bn, mandatory, has_expiry }
+      uploadedFiles: [],  // Array of { id, file, filename, size, pageCount, contentHash, arrayBuffer, ... }
+      matches: {},        // requirementId -> fileId
+      expiries: {},       // requirementId -> YYYY-MM-DD
+      activeFilter: 'all',// 'all' | 'ok' | 'missing' | 'expiry_needed' | 'expired' | 'not_provided' | 'duplicate'
       isGenerating: false,
       options: {
         includeIndexPage: true,
         signatureDataUrl: null,
-        signaturePlacement: 'cover-bottom-right', // 'cover-bottom-right', 'cover-bottom-left', 'last-bottom-right'
+        signaturePlacement: 'cover-bottom-right', // 'cover-bottom-right' | 'cover-bottom-left' | 'last-bottom-right'
         signatureScale: 1.0
       }
     };
@@ -40,19 +34,38 @@ class Store {
 
   notify() {
     for (const listener of this.listeners) {
-      listener(this.state);
+      try {
+        listener(this.state);
+      } catch (err) {
+        console.error("Store listener error:", err);
+      }
     }
   }
 
   setTender(tenderData) {
-    this.state.tender = { ...tenderData };
+    this.state.tender = tenderData ? { ...tenderData } : null;
     this.notify();
   }
 
   setRequirements(requirements) {
-    // Requirements must be sorted by order
-    const sorted = [...requirements].sort((a, b) => Number(a.order) - Number(b.order));
+    // Requirements must be sorted by numerical order
+    const sorted = Array.isArray(requirements) 
+      ? [...requirements].sort((a, b) => Number(a.order) - Number(b.order))
+      : [];
     this.state.requirements = sorted;
+    this.notify();
+  }
+
+  // Atomically load a complete new tender specification
+  loadTenderSpecification(tenderData, requirements) {
+    this.state.tender = tenderData ? { ...tenderData } : null;
+    this.state.requirements = Array.isArray(requirements)
+      ? [...requirements].sort((a, b) => Number(a.order) - Number(b.order))
+      : [];
+    // Reset matches and expiries for the new tender requirements
+    this.state.matches = {};
+    this.state.expiries = {};
+    this.state.activeFilter = 'all';
     this.notify();
   }
 
@@ -110,7 +123,7 @@ class Store {
 
   setExpiryDate(requirementId, dateString) {
     if (dateString) {
-      this.state.expiries[requirementId] = dateString;
+      this.state.expiries[requirementId] = dateString.trim();
     } else {
       delete this.state.expiries[requirementId];
     }
@@ -133,6 +146,8 @@ class Store {
   }
 
   resetAll() {
+    this.state.tender = null;
+    this.state.requirements = [];
     this.state.uploadedFiles = [];
     this.state.matches = {};
     this.state.expiries = {};
