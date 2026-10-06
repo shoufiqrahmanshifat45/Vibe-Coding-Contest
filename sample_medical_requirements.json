@@ -1,0 +1,51 @@
+{
+  "tender": {
+    "tender_id": "DGHS-2026-9042",
+    "title": "Procurement of Advanced Neonatal & Intensive Care Unit Medical Systems",
+    "procuring_entity": "Directorate General of Health Services (DGHS)",
+    "bidder": "BioMed Solutions International Ltd.",
+    "submission_deadline": "2026-12-25"
+  },
+  "requirements": [
+    {
+      "id": "med-1",
+      "order": 1,
+      "title_en": "Drug Administration & Medical Device Establishment License",
+      "title_bn": "ওষুধ প্রশাসন ও চিকিৎসা সরঞ্জাম প্রতিষ্ঠা লাইসেন্স",
+      "mandatory": true,
+      "has_expiry": true
+    },
+    {
+      "id": "med-2",
+      "order": 2,
+      "title_en": "Import Clearance & Registration Certificate",
+      "title_bn": "আমদানি ছাড়পত্র ও নিবন্ধন সনদ",
+      "mandatory": true,
+      "has_expiry": true
+    },
+    {
+      "id": "med-3",
+      "order": 3,
+      "title_en": "CE / US-FDA Quality Certification",
+      "title_bn": "সিই / ইউএস-এফডিএ গুণমান সনদ",
+      "mandatory": true,
+      "has_expiry": false
+    },
+    {
+      "id": "med-4",
+      "order": 4,
+      "title_en": "Tax Clearance Certificate for Assessment Year 2025-2026",
+      "title_bn": "কর পরিশোধ সনদ (করবর্ষ ২০২৫-২০২৬)",
+      "mandatory": true,
+      "has_expiry": false
+    },
+    {
+      "id": "med-5",
+      "order": 5,
+      "title_en": "Comprehensive 3-Year Warranty & OEM Maintenance Undertaking",
+      "title_bn": "৩ বছরের সামগ্রিক ওয়ারেন্টি ও রক্ষণাবেক্ষণ অঙ্গীকারনামা",
+      "mandatory": false,
+      "has_expiry": false
+    }
+  ]
+}
